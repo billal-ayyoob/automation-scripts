@@ -1,7 +1,8 @@
 #!/bin/bash
 
 create_log(){
-   echo "$date: backup for $date date has been verified and downloaded" >> ${LOG_FILE}
+   #To get the system date in the start of the log
+   echo "$(date): backup for $date date has been verified and downloaded" >> ${LOG_FILE}
 }
 
 #Step 1: Take a date as input in the yyyy-mm-dd format
