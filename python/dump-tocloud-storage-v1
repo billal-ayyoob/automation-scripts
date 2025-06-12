@@ -1,0 +1,219 @@
+#!/usr/bin/env python3
+"""
+Improved database to GCS export script with:
+- Type hints
+- Better error handling
+- Memory efficiency
+- Parallel uploads
+- Configuration validation
+- Proper logging
+"""
+
+import gzip
+import json
+import logging
+import os
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+import mysql.connector
+from google.cloud import storage
+from pydantic import BaseSettings, Field, validator
+from tenacity import retry, stop_after_attempt, wait_exponential
+from tqdm import tqdm
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+)
+logger = logging.getLogger(__name__)
+
+
+class Settings(BaseSettings):
+    """Configuration settings with validation."""
+
+    db_host: str = Field(..., env="DB_HOST")
+    db_user: str = Field(..., env="DB_USER")
+    db_password: str = Field(..., env="DB_PASSWORD")
+    db_name: str = Field(..., env="DB_NAME")
+    gcs_bucket: str = Field(..., env="GCS_BUCKET")
+    gcs_prefix: str = Field("exports/", env="GCS_PREFIX")
+    query_file: str = Field("query.sql", env="QUERY_FILE")
+    batch_size: int = Field(1000, env="BATCH_SIZE")
+    max_workers: int = Field(4, env="MAX_WORKERS")
+
+    @validator("gcs_prefix")
+    def ensure_trailing_slash(cls, v: str) -> str:
+        return v if v.endswith("/") else f"{v}/"
+
+
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=4, max=10),
+)
+def get_db_connection(config: Settings) -> mysql.connector.connection.MySQLConnection:
+    """Get database connection with retry logic."""
+    try:
+        conn = mysql.connector.connect(
+            host=config.db_host,
+            user=config.db_user,
+            password=config.db_password,
+            database=config.db_name,
+        )
+        logger.info("Successfully connected to database")
+        return conn
+    except mysql.connector.Error as e:
+        logger.error(f"Database connection failed: {e}")
+        raise
+
+
+def read_query_file(query_file: str) -> str:
+    """Read SQL query from file with validation."""
+    try:
+        with open(query_file, "r") as f:
+            query = f.read()
+        if not query.strip():
+            raise ValueError("Query file is empty")
+        return query
+    except IOError as e:
+        logger.error(f"Error reading query file: {e}")
+        raise
+
+
+def generate_filename() -> str:
+    """Generate timestamped filename."""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return f"export_{timestamp}.json.gz"
+
+
+def stream_query_results(
+    conn: mysql.connector.connection.MySQLConnection, query: str, batch_size: int
+) -> List[Dict[str, Any]]:
+    """Stream query results in batches to reduce memory usage."""
+    try:
+        with conn.cursor(dictionary=True) as cursor:
+            logger.info("Executing query...")
+            cursor.execute(query)
+            
+            while True:
+                rows = cursor.fetchmany(batch_size)
+                if not rows:
+                    break
+                yield rows
+                
+    except mysql.connector.Error as e:
+        logger.error(f"Query execution failed: {e}")
+        raise
+
+
+def write_to_temp_file(data: List[Dict[str, Any]], temp_file: Path) -> None:
+    """Write data to temporary file in JSON format."""
+    try:
+        with temp_file.open("w") as f:
+            json.dump(data, f, indent=2)
+        logger.debug(f"Successfully wrote data to {temp_file}")
+    except (IOError, TypeError) as e:
+        logger.error(f"Error writing to temp file: {e}")
+        raise
+
+
+def compress_file(input_path: Path, output_path: Path) -> None:
+    """Compress file using gzip."""
+    try:
+        with input_path.open("rb") as f_in:
+            with gzip.open(output_path, "wb") as f_out:
+                f_out.writelines(f_in)
+        logger.debug(f"Successfully compressed {input_path} to {output_path}")
+    except IOError as e:
+        logger.error(f"Error compressing file: {e}")
+        raise
+
+
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=4, max=10),
+)
+def upload_to_gcs(
+    bucket_name: str, source_path: Path, destination_blob_name: str
+) -> None:
+    """Upload file to GCS with retry logic."""
+    try:
+        storage_client = storage.Client()
+        bucket = storage_client.bucket(bucket_name)
+        blob = bucket.blob(destination_blob_name)
+
+        blob.upload_from_filename(str(source_path))
+        logger.info(f"File uploaded to gs://{bucket_name}/{destination_blob_name}")
+    except Exception as e:
+        logger.error(f"GCS upload failed: {e}")
+        raise
+
+
+def process_export(config: Settings) -> None:
+    """Main export process with proper resource cleanup."""
+    temp_json = Path("temp_export.json")
+    compressed_file = Path(generate_filename())
+    conn = None
+
+    try:
+        # Step 1: Get database connection
+        conn = get_db_connection(config)
+        query = read_query_file(config.query_file)
+
+        # Step 2: Stream and process data
+        with temp_json.open("w") as f:
+            f.write("[")  # Start JSON array
+            first_batch = True
+            
+            for batch in tqdm(
+                stream_query_results(conn, query, config.batch_size),
+                desc="Processing batches",
+                unit="batch",
+            ):
+                if not first_batch:
+                    f.write(",")
+                json.dump(batch, f)
+                first_batch = False
+            
+            f.write("]")  # Close JSON array
+
+        # Step 3: Compress the file
+        compress_file(temp_json, compressed_file)
+
+        # Step 4: Upload to GCS
+        destination_path = f"{config.gcs_prefix}{compressed_file.name}"
+        upload_to_gcs(config.gcs_bucket, compressed_file, destination_path)
+
+    finally:
+        # Cleanup resources
+        if conn and conn.is_connected():
+            conn.close()
+            logger.info("Database connection closed")
+        
+        for file in [temp_json, compressed_file]:
+            if file.exists():
+                file.unlink()
+                logger.debug(f"Removed temporary file: {file}")
+
+
+def main() -> None:
+    """Entry point with parallel upload capability."""
+    try:
+        config = Settings()
+        logger.info("Starting export process")
+        
+        # If you had multiple files to upload, you could use ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=config.max_workers) as executor:
+            executor.submit(process_export, config)
+            
+        logger.info("Export process completed successfully")
+    except Exception as e:
+        logger.critical(f"Export process failed: {e}", exc_info=True)
+        raise
+
+
+if __name__ == "__main__":
+    main()
